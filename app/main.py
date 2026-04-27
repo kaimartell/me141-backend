@@ -7,6 +7,7 @@ from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.geocode import router as geocode_router
@@ -24,6 +25,13 @@ app = FastAPI(
     title="Pedestrian Routing Prototype",
     version="0.1.0",
     description="Prototype backend for address geocoding and pedestrian route generation.",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.include_router(geocode_router)
