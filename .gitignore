@@ -1,0 +1,12 @@
+# Valhalla / map data
+custom_files/
+*.osm.pbf
+*.tar
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Environment
+.env
