@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     arcgis_rest_stop_url: str | None = Field(
         default=(
             "https://services3.arcgis.com/iuNbZYJOrAYBrPyC/arcgis/rest/services/"
-            "survey123_e4187ac026344439a0cbbe2af967c1a7/FeatureServer/0/query"
+            "survey123_e4187ac026344439a0cbbe2af967c1a7_results/FeatureServer/0/query"
         ),
         alias="ARCGIS_REST_STOP_URL",
     )
