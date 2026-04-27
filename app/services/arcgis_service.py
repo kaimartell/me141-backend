@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import httpx
@@ -17,6 +18,8 @@ from app.services.polyline_utils import to_arcgis_polyline_payload
 
 logger = logging.getLogger(__name__)
 
+SCORING_GEOMETRY_MAX_POINTS = 100
+
 REST_STOP_OUT_FIELDS = ",".join(
     [
         "objectid",
@@ -27,6 +30,16 @@ REST_STOP_OUT_FIELDS = ",".join(
         "EditDate",
     ]
 )
+
+
+@dataclass(frozen=True)
+class ScoringGeometry:
+    """ArcGIS scoring geometry plus metadata for diagnostics."""
+
+    polyline_payload: PolylinePayload
+    original_point_count: int
+    simplified_point_count: int
+    simplification_applied: bool
 
 
 class ArcGISService:
@@ -77,9 +90,14 @@ class ArcGISService:
     async def query_pois(self, polyline_payload: PolylinePayload) -> list[dict[str, Any]]:
         """Query obstacle POIs intersecting the route corridor."""
 
+        scoring_geometry = simplify_polyline_for_scoring(polyline_payload)
         return await self._query_features(
             self.settings.arcgis_poi_url,
-            params=self.arcgis_intersects_params(polyline_payload=polyline_payload),
+            params=self.arcgis_intersects_params(
+                polyline_payload=scoring_geometry.polyline_payload
+            ),
+            logical_query="POI obstacle query",
+            scoring_geometry=scoring_geometry,
         )
 
     async def query_rest_stops(
@@ -103,8 +121,9 @@ class ArcGISService:
 
         token_configured = bool(self.settings.arcgis_rest_stop_token)
         try:
+            scoring_geometry = simplify_polyline_for_scoring(polyline_payload)
             params = self.arcgis_intersects_params(
-                polyline_payload=polyline_payload,
+                polyline_payload=scoring_geometry.polyline_payload,
                 out_fields=REST_STOP_OUT_FIELDS,
                 return_geometry=True,
             )
@@ -114,6 +133,8 @@ class ArcGISService:
             features = await self._query_features(
                 self.settings.arcgis_rest_stop_url,
                 params=params,
+                logical_query="rest-stop query",
+                scoring_geometry=scoring_geometry,
                 normalizer=self._normalize_rest_stop_feature,
             )
         except UpstreamServiceError as exc:
@@ -167,12 +188,15 @@ class ArcGISService:
         """Query a specific Tufts basemap layer by numeric layer id."""
 
         url = f"{self.settings.arcgis_basemap_service_url.rstrip('/')}/{layer_id}/query"
+        scoring_geometry = simplify_polyline_for_scoring(polyline_payload)
         return await self._query_features(
             url,
             params=self.arcgis_intersects_params(
-                polyline_payload=polyline_payload,
+                polyline_payload=scoring_geometry.polyline_payload,
                 out_fields=out_fields,
             ),
+            logical_query=self._basemap_layer_query_name(layer_id),
+            scoring_geometry=scoring_geometry,
         )
 
     async def classify_route_surface(
@@ -256,82 +280,225 @@ class ArcGISService:
         url: str,
         *,
         params: dict[str, str],
+        logical_query: str,
+        scoring_geometry: ScoringGeometry,
         normalizer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         """Submit an ArcGIS query and normalize the returned features."""
 
+        method = "POST"
+        geometry_char_length = len(params.get("geometry", ""))
+        logger.info(
+            "ArcGIS request starting. logical_query=%s method=%s url=%s "
+            "route_point_count=%s simplified_point_count=%s simplification_applied=%s "
+            "geometry_chars=%s",
+            logical_query,
+            method,
+            url,
+            scoring_geometry.original_point_count,
+            scoring_geometry.simplified_point_count,
+            scoring_geometry.simplification_applied,
+            geometry_char_length,
+        )
+
         try:
             async with httpx.AsyncClient(timeout=self.settings.http_timeout_s) as client:
-                response = await client.get(url, params=params)
+                response = await client.post(url, data=params)
+                logger.info(
+                    "ArcGIS response received. logical_query=%s method=%s url=%s "
+                    "status_code=%s geometry_chars=%s",
+                    logical_query,
+                    method,
+                    url,
+                    response.status_code,
+                    geometry_char_length,
+                )
                 response.raise_for_status()
         except httpx.HTTPStatusError as exc:
+            response_text = _truncate_response_text(exc.response.text)
             logger.error(
-                "ArcGIS query failed. url=%s status_code=%s params=%s response=%s",
+                "ArcGIS query failed. logical_query=%s method=%s url=%s status_code=%s "
+                "route_point_count=%s simplified_point_count=%s geometry_chars=%s params=%s response=%s",
+                logical_query,
+                method,
                 url,
                 exc.response.status_code,
+                scoring_geometry.original_point_count,
+                scoring_geometry.simplified_point_count,
+                geometry_char_length,
                 _sanitize_query_params(params),
-                exc.response.text,
+                response_text,
             )
             details = None
             if self.settings.prototype_mode:
                 details = {
+                    "logical_query": logical_query,
+                    "method": method,
                     "url": url,
                     "params": _sanitize_query_params(params),
                     "status_code": exc.response.status_code,
-                    "response_text": exc.response.text,
+                    "response_text": response_text,
+                    "route_point_count": scoring_geometry.original_point_count,
+                    "simplified_point_count": scoring_geometry.simplified_point_count,
+                    "simplification_applied": scoring_geometry.simplification_applied,
+                    "geometry_char_length": geometry_char_length,
                 }
-            raise UpstreamServiceError("ArcGIS query failed.", details=details) from exc
+            raise UpstreamServiceError(
+                f"ArcGIS {logical_query} failed.",
+                details=details,
+            ) from exc
         except httpx.HTTPError as exc:
             logger.error(
-                "ArcGIS request failed before response. url=%s params=%s error=%s",
+                "ArcGIS request failed before response. logical_query=%s method=%s url=%s "
+                "route_point_count=%s simplified_point_count=%s geometry_chars=%s params=%s error=%s",
+                logical_query,
+                method,
                 url,
+                scoring_geometry.original_point_count,
+                scoring_geometry.simplified_point_count,
+                geometry_char_length,
                 _sanitize_query_params(params),
                 str(exc),
             )
             details = None
             if self.settings.prototype_mode:
                 details = {
+                    "logical_query": logical_query,
+                    "method": method,
                     "url": url,
                     "params": _sanitize_query_params(params),
                     "upstream_error": str(exc),
+                    "route_point_count": scoring_geometry.original_point_count,
+                    "simplified_point_count": scoring_geometry.simplified_point_count,
+                    "simplification_applied": scoring_geometry.simplification_applied,
+                    "geometry_char_length": geometry_char_length,
                 }
-            raise UpstreamServiceError("Failed to reach ArcGIS service.", details=details) from exc
+            raise UpstreamServiceError(
+                f"Failed to reach ArcGIS service for {logical_query}.",
+                details=details,
+            ) from exc
 
         try:
             payload = response.json()
         except ValueError as exc:
-            logger.error("ArcGIS returned invalid JSON. url=%s response=%s", url, response.text)
+            response_text = _truncate_response_text(response.text)
+            logger.error(
+                "ArcGIS returned invalid JSON. logical_query=%s method=%s url=%s "
+                "status_code=%s response=%s",
+                logical_query,
+                method,
+                url,
+                response.status_code,
+                response_text,
+            )
             details = None
             if self.settings.prototype_mode:
                 details = {
+                    "logical_query": logical_query,
+                    "method": method,
                     "url": url,
                     "params": _sanitize_query_params(params),
-                    "response_text": response.text,
+                    "status_code": response.status_code,
+                    "response_text": response_text,
+                    "route_point_count": scoring_geometry.original_point_count,
+                    "simplified_point_count": scoring_geometry.simplified_point_count,
+                    "simplification_applied": scoring_geometry.simplification_applied,
+                    "geometry_char_length": geometry_char_length,
                 }
-            raise UpstreamServiceError("ArcGIS returned invalid JSON.", details=details) from exc
+            raise UpstreamServiceError(
+                f"ArcGIS {logical_query} returned invalid JSON.",
+                details=details,
+            ) from exc
 
         if not isinstance(payload, dict):
             raise UpstreamServiceError(
-                "Unexpected ArcGIS response format.",
-                details=payload if self.settings.prototype_mode else None,
+                f"Unexpected ArcGIS response format for {logical_query}.",
+                details=(
+                    {
+                        "logical_query": logical_query,
+                        "method": method,
+                        "url": url,
+                        "status_code": response.status_code,
+                        "response_payload": payload,
+                        "route_point_count": scoring_geometry.original_point_count,
+                        "simplified_point_count": scoring_geometry.simplified_point_count,
+                        "simplification_applied": scoring_geometry.simplification_applied,
+                        "geometry_char_length": geometry_char_length,
+                    }
+                    if self.settings.prototype_mode
+                    else None
+                ),
             )
 
         if payload.get("error"):
-            logger.error("ArcGIS returned an error payload. url=%s error=%s", url, payload["error"])
+            logger.error(
+                "ArcGIS returned an error payload. logical_query=%s method=%s url=%s "
+                "status_code=%s route_point_count=%s simplified_point_count=%s "
+                "geometry_chars=%s error=%s response=%s",
+                logical_query,
+                method,
+                url,
+                response.status_code,
+                scoring_geometry.original_point_count,
+                scoring_geometry.simplified_point_count,
+                geometry_char_length,
+                payload["error"],
+                _truncate_response_text(response.text),
+            )
             raise UpstreamServiceError(
-                "ArcGIS query returned an error response.",
-                details=payload if self.settings.prototype_mode else None,
+                f"ArcGIS {logical_query} returned an error response.",
+                details=(
+                    {
+                        "logical_query": logical_query,
+                        "method": method,
+                        "url": url,
+                        "status_code": response.status_code,
+                        "arcgis_error": payload["error"],
+                        "response_text": _truncate_response_text(response.text),
+                        "route_point_count": scoring_geometry.original_point_count,
+                        "simplified_point_count": scoring_geometry.simplified_point_count,
+                        "simplification_applied": scoring_geometry.simplification_applied,
+                        "geometry_char_length": geometry_char_length,
+                    }
+                    if self.settings.prototype_mode
+                    else None
+                ),
             )
 
         features = payload.get("features", [])
         if not isinstance(features, list):
             raise UpstreamServiceError(
-                "ArcGIS response did not include a valid feature list.",
-                details=payload if self.settings.prototype_mode else None,
+                f"ArcGIS {logical_query} response did not include a valid feature list.",
+                details=(
+                    {
+                        "logical_query": logical_query,
+                        "method": method,
+                        "url": url,
+                        "status_code": response.status_code,
+                        "response_payload": payload,
+                        "route_point_count": scoring_geometry.original_point_count,
+                        "simplified_point_count": scoring_geometry.simplified_point_count,
+                        "simplification_applied": scoring_geometry.simplification_applied,
+                        "geometry_char_length": geometry_char_length,
+                    }
+                    if self.settings.prototype_mode
+                    else None
+                ),
             )
 
         normalize = normalizer or self._normalize_feature
         return [normalize(feature) for feature in features if isinstance(feature, dict)]
+
+    def _basemap_layer_query_name(self, layer_id: int) -> str:
+        """Return a stable diagnostics label for a configured basemap layer."""
+
+        if layer_id == self.settings.arcgis_gravel_layer_id:
+            return "gravel layer query"
+        if layer_id == self.settings.arcgis_sidewalk_layer_id:
+            return "sidewalk layer query"
+        if layer_id == self.settings.arcgis_path_layer_id:
+            return "path layer query"
+        return f"basemap layer {layer_id} query"
 
     def arcgis_feature_to_geojson(self, feature: dict[str, Any]) -> dict[str, Any] | None:
         """Convert a limited subset of ArcGIS geometries into GeoJSON."""
@@ -424,6 +591,55 @@ class ArcGISService:
         return labels
 
 
+def simplify_polyline_for_scoring(
+    polyline_payload: PolylinePayload,
+    *,
+    max_points_per_path: int = SCORING_GEOMETRY_MAX_POINTS,
+) -> ScoringGeometry:
+    """Return a scoring-only polyline capped to a practical ArcGIS query size."""
+
+    simplified_paths: list[list[list[float]]] = []
+    original_point_count = 0
+
+    for path in polyline_payload.paths:
+        original_point_count += len(path)
+        simplified_paths.append(_downsample_path(path, max_points_per_path))
+
+    simplified_point_count = sum(len(path) for path in simplified_paths)
+    simplification_applied = simplified_point_count != original_point_count
+
+    return ScoringGeometry(
+        polyline_payload=PolylinePayload(
+            paths=simplified_paths,
+            spatialReference=polyline_payload.spatialReference,
+        ),
+        original_point_count=original_point_count,
+        simplified_point_count=simplified_point_count,
+        simplification_applied=simplification_applied,
+    )
+
+
+def _downsample_path(
+    path: list[list[float]],
+    max_points: int,
+) -> list[list[float]]:
+    """Evenly downsample a path while preserving endpoints and coordinate order."""
+
+    if len(path) <= max_points:
+        return [list(point) for point in path]
+
+    if max_points < 2:
+        raise ValueError("max_points must be at least 2")
+
+    last_index = len(path) - 1
+    step = last_index / (max_points - 1)
+    indexes = [round(index * step) for index in range(max_points)]
+    indexes[0] = 0
+    indexes[-1] = last_index
+
+    return [list(path[index]) for index in indexes]
+
+
 def _get_case_insensitive(attributes: dict[str, Any], field_name: str) -> Any | None:
     """Return an attribute value regardless of input key casing."""
 
@@ -484,7 +700,17 @@ def _sanitize_query_params(params: dict[str, str]) -> dict[str, str]:
     sanitized = dict(params)
     if "token" in sanitized:
         sanitized["token"] = "***redacted***"
+    if "geometry" in sanitized:
+        sanitized["geometry"] = f"<{len(sanitized['geometry'])} chars>"
     return sanitized
+
+
+def _truncate_response_text(response_text: str, *, limit: int = 2000) -> str:
+    """Cap upstream response text in logs and prototype diagnostics."""
+
+    if len(response_text) <= limit:
+        return response_text
+    return f"{response_text[:limit]}...<truncated {len(response_text) - limit} chars>"
 
 
 def _rest_stop_failure_reason(exc: UpstreamServiceError) -> str:
@@ -492,7 +718,7 @@ def _rest_stop_failure_reason(exc: UpstreamServiceError) -> str:
 
     details = exc.details
     if isinstance(details, dict):
-        error_payload = details.get("error")
+        error_payload = details.get("arcgis_error") or details.get("error")
         if isinstance(error_payload, dict):
             message = error_payload.get("message")
             if isinstance(message, str) and message.strip():
@@ -519,7 +745,7 @@ def _upstream_status_code(exc: UpstreamServiceError) -> int | None:
         status_code = details.get("status_code")
         if isinstance(status_code, int):
             return status_code
-        error_payload = details.get("error")
+        error_payload = details.get("arcgis_error") or details.get("error")
         if isinstance(error_payload, dict):
             code = error_payload.get("code")
             if isinstance(code, int):

@@ -7,9 +7,14 @@ import json
 import httpx
 import pytest
 
+from app.core.exceptions import UpstreamServiceError
 from app.core.config import Settings
 from app.models.routing import PolylinePayload, SpatialReference
-from app.services.arcgis_service import ArcGISService, parse_rest_quality_score
+from app.services.arcgis_service import (
+    ArcGISService,
+    parse_rest_quality_score,
+    simplify_polyline_for_scoring,
+)
 
 
 def test_arcgis_intersects_params_builds_expected_polyline_query() -> None:
@@ -38,8 +43,10 @@ def test_arcgis_intersects_params_builds_expected_polyline_query() -> None:
 
 
 @pytest.mark.anyio
-async def test_query_pois_uses_configured_arcgis_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    """POI queries should hit the configured ArcGIS endpoint with corridor params."""
+async def test_query_pois_uses_post_to_configured_arcgis_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POI queries should POST corridor params to the configured ArcGIS endpoint."""
 
     captured: dict[str, object] = {}
 
@@ -53,10 +60,11 @@ async def test_query_pois_uses_configured_arcgis_url(monkeypatch: pytest.MonkeyP
         async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
             return None
 
-        async def get(self, url: str, *, params: dict[str, str] | None = None) -> httpx.Response:
+        async def post(self, url: str, *, data: dict[str, str] | None = None) -> httpx.Response:
+            captured["method"] = "POST"
             captured["url"] = url
-            captured["params"] = params
-            request = httpx.Request("GET", url, params=params)
+            captured["params"] = data
+            request = httpx.Request("POST", url, data=data)
             return httpx.Response(200, json={"features": []}, request=request)
 
     monkeypatch.setattr("app.services.arcgis_service.httpx.AsyncClient", FakeAsyncClient)
@@ -72,6 +80,7 @@ async def test_query_pois_uses_configured_arcgis_url(monkeypatch: pytest.MonkeyP
     await service.query_pois(polyline_payload)
 
     params = captured["params"]
+    assert captured["method"] == "POST"
     assert captured["url"] == "https://example.test/FeatureServer/0/query"
     assert params["geometryType"] == "esriGeometryPolyline"  # type: ignore[index]
     assert params["spatialRel"] == "esriSpatialRelIntersects"  # type: ignore[index]
@@ -85,6 +94,74 @@ def test_parse_rest_quality_score_handles_survey123_strings() -> None:
     assert parse_rest_quality_score("2 = okay") == 2
     assert parse_rest_quality_score("3 = good") == 3
     assert parse_rest_quality_score("unknown") is None
+
+
+def test_long_scoring_geometry_is_downsampled_without_mutating_route_payload() -> None:
+    """Long route geometry should be capped only for ArcGIS scoring queries."""
+
+    original_points = [[-71.12 + (index * 0.0001), 42.40 + (index * 0.0001)] for index in range(250)]
+    original_payload = PolylinePayload(
+        paths=[original_points],
+        spatialReference=SpatialReference(),
+    )
+
+    scoring_geometry = simplify_polyline_for_scoring(original_payload, max_points_per_path=75)
+
+    assert scoring_geometry.original_point_count == 250
+    assert scoring_geometry.simplified_point_count == 75
+    assert scoring_geometry.simplification_applied is True
+    assert scoring_geometry.polyline_payload.paths[0][0] == original_points[0]
+    assert scoring_geometry.polyline_payload.paths[0][-1] == original_points[-1]
+    assert len(original_payload.paths[0]) == 250
+
+
+@pytest.mark.anyio
+async def test_arcgis_error_details_include_logical_query_and_geometry_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prototype-mode ArcGIS errors should identify the failed logical query."""
+
+    class FakeAsyncClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            return None
+
+        async def __aenter__(self) -> "FakeAsyncClient":
+            return self
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        async def post(self, url: str, *, data: dict[str, str] | None = None) -> httpx.Response:
+            request = httpx.Request("POST", url, data=data)
+            return httpx.Response(
+                200,
+                json={
+                    "error": {
+                        "code": 400,
+                        "message": "Unable to complete operation.",
+                        "details": ["Geometry is too large."],
+                    }
+                },
+                request=request,
+            )
+
+    monkeypatch.setattr("app.services.arcgis_service.httpx.AsyncClient", FakeAsyncClient)
+
+    service = ArcGISService(
+        settings=Settings(
+            ARCGIS_POI_URL="https://example.test/FeatureServer/0/query",
+            PROTOTYPE_MODE=True,
+        )
+    )
+
+    with pytest.raises(UpstreamServiceError) as exc_info:
+        await service.query_pois(_polyline_payload())
+
+    assert exc_info.value.message == "ArcGIS POI obstacle query returned an error response."
+    assert exc_info.value.details["logical_query"] == "POI obstacle query"  # type: ignore[index]
+    assert exc_info.value.details["method"] == "POST"  # type: ignore[index]
+    assert exc_info.value.details["route_point_count"] == 2  # type: ignore[index]
+    assert exc_info.value.details["geometry_char_length"] > 0  # type: ignore[index]
 
 
 @pytest.mark.anyio
@@ -120,10 +197,11 @@ async def test_query_rest_stops_anonymous_success_sets_available_status(
         async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
             return None
 
-        async def get(self, url: str, *, params: dict[str, str] | None = None) -> httpx.Response:
+        async def post(self, url: str, *, data: dict[str, str] | None = None) -> httpx.Response:
             captured["url"] = url
-            captured["params"] = params
-            request = httpx.Request("GET", url, params=params)
+            captured["method"] = "POST"
+            captured["params"] = data
+            request = httpx.Request("POST", url, data=data)
             return httpx.Response(200, json=response_payload, request=request)
 
     monkeypatch.setattr("app.services.arcgis_service.httpx.AsyncClient", FakeAsyncClient)
@@ -138,6 +216,7 @@ async def test_query_rest_stops_anonymous_success_sets_available_status(
     result = await service.query_rest_stops(_polyline_payload())
 
     params = captured["params"]
+    assert captured["method"] == "POST"
     assert "token" not in params  # type: ignore[operator]
     assert result["raw_feature_count"] == 1
     assert result["source_status"] == {
@@ -179,9 +258,10 @@ async def test_query_rest_stops_attaches_token_when_configured(
         async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
             return None
 
-        async def get(self, url: str, *, params: dict[str, str] | None = None) -> httpx.Response:
-            captured["params"] = params
-            request = httpx.Request("GET", url, params=params)
+        async def post(self, url: str, *, data: dict[str, str] | None = None) -> httpx.Response:
+            captured["method"] = "POST"
+            captured["params"] = data
+            request = httpx.Request("POST", url, data=data)
             return httpx.Response(200, json={"features": []}, request=request)
 
     monkeypatch.setattr("app.services.arcgis_service.httpx.AsyncClient", FakeAsyncClient)
@@ -196,6 +276,7 @@ async def test_query_rest_stops_attaches_token_when_configured(
 
     result = await service.query_rest_stops(_polyline_payload())
 
+    assert captured["method"] == "POST"
     assert captured["params"]["token"] == "secret-token"  # type: ignore[index]
     assert result["source_status"] == {
         "configured": True,
@@ -222,8 +303,8 @@ async def test_query_rest_stops_token_required_degrades_gracefully(
         async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
             return None
 
-        async def get(self, url: str, *, params: dict[str, str] | None = None) -> httpx.Response:
-            request = httpx.Request("GET", url, params=params)
+        async def post(self, url: str, *, data: dict[str, str] | None = None) -> httpx.Response:
+            request = httpx.Request("POST", url, data=data)
             return httpx.Response(
                 200,
                 json={
@@ -291,8 +372,8 @@ async def test_query_rest_stops_unconfigured_and_empty_success_are_distinct(
         async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
             return None
 
-        async def get(self, url: str, *, params: dict[str, str] | None = None) -> httpx.Response:
-            request = httpx.Request("GET", url, params=params)
+        async def post(self, url: str, *, data: dict[str, str] | None = None) -> httpx.Response:
+            request = httpx.Request("POST", url, data=data)
             return httpx.Response(200, json={"features": []}, request=request)
 
     monkeypatch.setattr("app.services.arcgis_service.httpx.AsyncClient", FakeAsyncClient)
