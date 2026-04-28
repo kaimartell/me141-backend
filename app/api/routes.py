@@ -154,13 +154,18 @@ async def generate_and_score_routes(
         ScoredRouteCandidate(**route.model_dump(), score=score)
         for route, score in zip(generation.distinct_candidates, scores)
     ]
-    scored_routes.sort(key=lambda route: route.score.overall_score, reverse=True)
+    scored_routes = _preference_sorted_routes(
+        scored_routes,
+        request.route_preference,
+    )
     scored_routes = scored_routes[: generation.diagnostics.returned_route_count]
     logger.info(
         "Route generate-and-score completed. requested_alternatives=%s "
+        "route_preference=%s "
         "candidate_count_before_dedupe=%s candidate_count_after_dedupe=%s "
         "returned_route_count=%s",
         generation.diagnostics.requested_alternatives,
+        request.route_preference,
         generation.diagnostics.raw_candidate_count,
         generation.diagnostics.distinct_candidate_count,
         len(scored_routes),
@@ -172,6 +177,58 @@ async def generate_and_score_routes(
         mode=request.mode,
         requested_alternatives=request.alternatives,
         routes=scored_routes,
+    )
+
+
+def _preference_sorted_routes(
+    routes: list[ScoredRouteCandidate],
+    route_preference: str,
+) -> list[ScoredRouteCandidate]:
+    """Sort scored routes so the requested preference influences the returned order."""
+
+    return sorted(
+        routes,
+        key=lambda route: _route_preference_sort_key(route, route_preference),
+        reverse=True,
+    )
+
+
+def _route_preference_sort_key(
+    route: ScoredRouteCandidate,
+    route_preference: str,
+) -> tuple[float, ...]:
+    """Return a stable preference-specific ranking key for scored routes."""
+
+    score = route.score
+    metrics = score.metrics
+    category_scores = score.category_scores
+
+    if route_preference == "easiest":
+        return (
+            category_scores.surface,
+            category_scores.obstacles,
+            category_scores.crossings,
+            score.overall_score,
+            -route.duration_s,
+            -route.distance_m,
+        )
+
+    if route_preference == "restful":
+        return (
+            category_scores.rest_support,
+            float(metrics.rest_stop_count),
+            float(metrics.avg_rest_quality or 0.0),
+            score.overall_score,
+            category_scores.obstacles,
+            -route.duration_s,
+        )
+
+    return (
+        category_scores.efficiency,
+        score.overall_score,
+        -route.duration_s,
+        -route.distance_m,
+        category_scores.obstacles,
     )
 
 

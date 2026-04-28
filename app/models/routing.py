@@ -58,6 +58,7 @@ class RouteGenerationRequest(BaseModel):
     origin: LocationInput
     destination: LocationInput
     mode: Literal["pedestrian"] = "pedestrian"
+    route_preference: Literal["shortest", "easiest", "restful"] = "shortest"
     alternatives: int = Field(
         default=1,
         ge=1,

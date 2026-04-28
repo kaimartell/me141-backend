@@ -139,6 +139,32 @@ class FakeRankedScoringService:
         return _score_response(route.route_id, overall_score=overall_score)
 
 
+class FakePreferenceScoringService:
+    """Scoring stub that exposes different winners for different preferences."""
+
+    async def score_request(self, request: object) -> RouteScoreResponse:
+        route = request.route  # type: ignore[attr-defined]
+        if route.route_id == "route-low":
+            return _score_response(
+                route.route_id,
+                overall_score=72.0,
+                efficiency=96.0,
+                rest_support=18.0,
+                surface=70.0,
+                rest_stop_count=0,
+            )
+
+        return _score_response(
+            route.route_id,
+            overall_score=68.0,
+            efficiency=65.0,
+            rest_support=92.0,
+            surface=86.0,
+            rest_stop_count=3,
+            avg_rest_quality=3.0,
+        )
+
+
 def test_score_endpoint_rejects_missing_route_and_polyline_payload() -> None:
     """Scoring input must include either a route object or a polyline payload."""
 
@@ -246,6 +272,41 @@ def test_generate_and_score_scores_distinct_candidates_and_returns_best_requeste
     assert payload["routes"][0]["score"]["overall_score"] == 91.0
 
 
+def test_generate_and_score_route_preference_changes_returned_ranking() -> None:
+    """Preference-aware ranking should change which route is returned first."""
+
+    app.dependency_overrides[get_valhalla_service] = lambda: FakeDiverseValhallaService()
+    app.dependency_overrides[get_scoring_service] = lambda: FakePreferenceScoringService()
+    try:
+        shortest = client.post(
+            "/routes/generate-and-score",
+            json={
+                "origin": {"lat": 42.40852, "lon": -71.1183248},
+                "destination": {"lat": 42.4067, "lon": -71.1150},
+                "mode": "pedestrian",
+                "route_preference": "shortest",
+                "alternatives": 1,
+            },
+        )
+        restful = client.post(
+            "/routes/generate-and-score",
+            json={
+                "origin": {"lat": 42.40852, "lon": -71.1183248},
+                "destination": {"lat": 42.4067, "lon": -71.1150},
+                "mode": "pedestrian",
+                "route_preference": "restful",
+                "alternatives": 1,
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert shortest.status_code == 200
+    assert restful.status_code == 200
+    assert shortest.json()["routes"][0]["route_id"] == "route-low"
+    assert restful.json()["routes"][0]["route_id"] == "route-high"
+
+
 def _route_candidate(route_id: str, *, distance_m: float) -> RouteCandidate:
     """Build a compact route candidate for API tests."""
 
@@ -269,7 +330,16 @@ def _route_candidate(route_id: str, *, distance_m: float) -> RouteCandidate:
     )
 
 
-def _score_response(route_id: str, *, overall_score: float) -> RouteScoreResponse:
+def _score_response(
+    route_id: str,
+    *,
+    overall_score: float,
+    efficiency: float = 80.0,
+    rest_support: float = 10.0,
+    surface: float = 75.0,
+    rest_stop_count: int = 0,
+    avg_rest_quality: float | None = None,
+) -> RouteScoreResponse:
     """Build a compact scoring response for API tests."""
 
     return RouteScoreResponse(
@@ -290,16 +360,17 @@ def _score_response(route_id: str, *, overall_score: float) -> RouteScoreRespons
             matched_segment_count=1,
             matched_surface_feature_counts={"gravel": 0, "sidewalk": 1, "path": 0},
             surface_presence={"sidewalk": 100.0},
-            rest_stop_count=0,
+            rest_stop_count=rest_stop_count,
+            avg_rest_quality=avg_rest_quality,
             rest_stop_types=[],
             rest_stop_data_available=True,
         ),
         category_scores=RouteCategoryScores(
             obstacles=100.0,
             crossings=100.0,
-            surface=75.0,
-            rest_support=10.0,
-            efficiency=80.0,
+            surface=surface,
+            rest_support=rest_support,
+            efficiency=efficiency,
         ),
         overall_score=overall_score,
         explanation="Test score.",
