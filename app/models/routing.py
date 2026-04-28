@@ -204,6 +204,7 @@ class RouteScoreRawArcGIS(BaseModel):
     pois: list[dict[str, Any]] = Field(default_factory=list)
     surface_summary: dict[str, Any] = Field(default_factory=dict)
     rest_stops: list[dict[str, Any]] = Field(default_factory=list)
+    diagnostics: dict[str, Any] = Field(default_factory=dict)
 
 
 class RouteScoreResponse(BaseModel):

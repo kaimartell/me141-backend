@@ -87,6 +87,54 @@ async def test_query_pois_uses_post_to_configured_arcgis_url(
     assert params["returnGeometry"] == "true"  # type: ignore[index]
 
 
+@pytest.mark.anyio
+async def test_feature_specific_corridor_distances_are_used(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each ArcGIS feature type should use its own corridor distance."""
+
+    captured: list[dict[str, str] | None] = []
+
+    class FakeAsyncClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            return None
+
+        async def __aenter__(self) -> "FakeAsyncClient":
+            return self
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        async def post(self, url: str, *, data: dict[str, str] | None = None) -> httpx.Response:
+            captured.append(data)
+            request = httpx.Request("POST", url, data=data)
+            return httpx.Response(200, json={"features": []}, request=request)
+
+    monkeypatch.setattr("app.services.arcgis_service.httpx.AsyncClient", FakeAsyncClient)
+
+    service = ArcGISService(
+        settings=Settings(
+            ARCGIS_CORRIDOR_DISTANCE_M=99,
+            ARCGIS_POI_CORRIDOR_DISTANCE_M=12,
+            ARCGIS_REST_STOP_CORRIDOR_DISTANCE_M=18,
+            ARCGIS_SURFACE_CORRIDOR_DISTANCE_M=8,
+            ARCGIS_POI_URL="https://example.test/poi/FeatureServer/0/query",
+            ARCGIS_REST_STOP_URL="https://example.test/rest/FeatureServer/0/query",
+            ARCGIS_BASEMAP_SERVICE_URL="https://example.test/base/FeatureServer",
+            PROTOTYPE_MODE=True,
+        )
+    )
+    polyline_payload = _polyline_payload()
+
+    await service.query_pois(polyline_payload)
+    await service.query_rest_stops(polyline_payload)
+    await service.query_basemap_layer(polyline_payload, layer_id=15)
+
+    assert captured[0]["distance"] == "12.0"  # type: ignore[index]
+    assert captured[1]["distance"] == "18.0"  # type: ignore[index]
+    assert captured[2]["distance"] == "8.0"  # type: ignore[index]
+
+
 def test_parse_rest_quality_score_handles_survey123_strings() -> None:
     """Survey123 rest-quality strings should be converted into numeric scores."""
 

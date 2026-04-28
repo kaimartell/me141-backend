@@ -61,6 +61,22 @@ def _score_request() -> RouteScoreRequest:
     )
 
 
+def _score_request_with_points(point_count: int) -> RouteScoreRequest:
+    """Return a scoring request with a configurable route length."""
+
+    points = [
+        [-71.1183248 + (index * 0.00001), 42.40852 + (index * 0.00001)]
+        for index in range(point_count)
+    ]
+    return RouteScoreRequest(
+        route_id=f"route-{point_count}",
+        polyline_payload=PolylinePayload(
+            paths=[points],
+            spatialReference=SpatialReference(),
+        ),
+    )
+
+
 def test_default_category_weights_prioritize_obstacles_and_rest_support() -> None:
     """The prototype weighting should emphasize obstacle burden and rest support."""
 
@@ -211,3 +227,20 @@ async def test_worse_obstacle_burden_scores_lower_all_else_equal() -> None:
 
     assert low_obstacle.category_scores.obstacles > high_obstacle.category_scores.obstacles
     assert low_obstacle.overall_score > high_obstacle.overall_score
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("point_count", [2, 150])
+async def test_scoring_service_handles_short_and_long_route_geometries(
+    point_count: int,
+) -> None:
+    """Scoring should keep working for both short and longer route geometries."""
+
+    service = ScoringService(arcgis_service=ScenarioArcGISService())
+
+    response = await service.score_request(_score_request_with_points(point_count))
+
+    assert response.route_id == f"route-{point_count}"
+    assert response.metrics.route_point_count == point_count
+    assert response.metrics.distance_m >= 0
+    assert 0.0 <= response.overall_score <= 100.0

@@ -89,9 +89,12 @@ ARCGIS_BASEMAP_SERVICE_URL=https://services7.arcgis.com/UlEfxLrnpFcC1i8z/ArcGIS/
 ARCGIS_GRAVEL_LAYER_ID=20
 ARCGIS_SIDEWALK_LAYER_ID=15
 ARCGIS_PATH_LAYER_ID=14
-ARCGIS_CORRIDOR_DISTANCE_M=10
+ARCGIS_POI_CORRIDOR_DISTANCE_M=12
+ARCGIS_REST_STOP_CORRIDOR_DISTANCE_M=18
+ARCGIS_SURFACE_CORRIDOR_DISTANCE_M=8
 ARCGIS_REST_STOP_URL=https://services3.arcgis.com/iuNbZYJOrAYBrPyC/arcgis/rest/services/survey123_e4187ac026344439a0cbbe2af967c1a7_results/FeatureServer/0/query
 ARCGIS_REST_STOP_TOKEN=
+VALHALLA_INTERNAL_CANDIDATE_COUNT=6
 APP_HOST=0.0.0.0
 APP_PORT=8000
 LOG_LEVEL=INFO
@@ -113,9 +116,13 @@ Supported settings:
 - `ARCGIS_GRAVEL_LAYER_ID`
 - `ARCGIS_SIDEWALK_LAYER_ID`
 - `ARCGIS_PATH_LAYER_ID`
-- `ARCGIS_CORRIDOR_DISTANCE_M`
+- `ARCGIS_POI_CORRIDOR_DISTANCE_M` default: `12`
+- `ARCGIS_REST_STOP_CORRIDOR_DISTANCE_M` default: `18`
+- `ARCGIS_SURFACE_CORRIDOR_DISTANCE_M` default: `8`
+- `ARCGIS_CORRIDOR_DISTANCE_M` legacy generic corridor used only by direct helper calls
 - `ARCGIS_REST_STOP_URL`
 - `ARCGIS_REST_STOP_TOKEN`
+- `VALHALLA_INTERNAL_CANDIDATE_COUNT` default: `6`, capped internally at `8`
 - `HTTP_TIMEOUT_S`
 
 ## Valhalla Local Setup
@@ -536,6 +543,8 @@ The current scoring layer is a prototype heuristic, not a validated accessibilit
 - The default prototype weighting currently emphasizes obstacle burden and rest support for early testing.
 - Surface scoring is currently an approximation based on intersecting polygon features, not clipped segment lengths.
 - Gravel, sidewalk, and path exposure are inferred from matched basemap features within a route corridor.
+- ArcGIS scoring uses feature-specific corridor defaults: `12 m` for obstacle POIs, `18 m` for rest stops, and `8 m` for sidewalk/path/gravel surface layers.
+- Scoring diagnostics under `raw_arcgis.diagnostics` include corridor distances, raw feature counts, and original versus scoring geometry point counts.
 - Obstacle scoring now prioritizes severe barriers, especially `Not accessible` and `Safety hazard` issues.
 - Rest-stop data is wired to the configured ArcGIS Survey123 layer using `what_kind_of_rest_stop_is_this` and `rest_quality`.
 - If that layer requires ArcGIS authentication, set `ARCGIS_REST_STOP_TOKEN` so the backend can query it.
@@ -559,11 +568,18 @@ Troubleshooting:
 
 ## Notes on Valhalla Alternatives
 
-The public API uses `alternatives` as the requested number of route candidates. Internally, the Valhalla client maps that to Valhalla's `alternates` field and keeps the backend response schema as `routes: []`.
+The public API uses `alternatives` as the requested number of final route candidates. Internally, the backend now asks Valhalla for a larger candidate pool, deduplicates near-identical route geometries, and keeps only a small useful set in the frontend response.
+
+Current behavior:
+
+- if the client asks for one route, the backend still tries to generate several internal candidates
+- near-identical candidate shapes are collapsed before scoring or returning routes
+- `/routes/generate` returns only the requested count, capped at three routes
+- `/routes/generate-and-score` scores all distinct internal candidates, sorts by score, and returns only the best requested count, capped at three routes
+- candidate counts before and after deduplication are written to logs for validation
 
 The service layer is structured so it can later expand to:
 
-- native Valhalla alternate route support
 - multiple candidate generation strategies
 - richer downstream GIS scoring integration on normalized geometry output
 

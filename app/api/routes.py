@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from fastapi import APIRouter, Depends
 
@@ -25,6 +26,7 @@ from app.services.scoring_service import ScoringService
 from app.services.valhalla_service import ValhallaService
 
 router = APIRouter(prefix="/routes", tags=["routes"])
+logger = logging.getLogger(__name__)
 
 
 def get_valhalla_service() -> ValhallaService:
@@ -58,7 +60,7 @@ async def generate_routes(
 
     origin = await _resolve_location(request.origin, nominatim_service)
     destination = await _resolve_location(request.destination, nominatim_service)
-    routes = await valhalla_service.generate_routes(
+    generation = await valhalla_service.generate_route_candidates(
         origin=origin,
         destination=destination,
         mode=request.mode,
@@ -70,7 +72,7 @@ async def generate_routes(
         destination=destination,
         mode=request.mode,
         requested_alternatives=request.alternatives,
-        routes=routes,
+        routes=generation.routes,
     )
 
 
@@ -135,7 +137,7 @@ async def generate_and_score_routes(
 
     origin = await _resolve_location(request.origin, nominatim_service)
     destination = await _resolve_location(request.destination, nominatim_service)
-    routes = await valhalla_service.generate_routes(
+    generation = await valhalla_service.generate_route_candidates(
         origin=origin,
         destination=destination,
         mode=request.mode,
@@ -144,14 +146,25 @@ async def generate_and_score_routes(
     scores = await asyncio.gather(
         *[
             scoring_service.score_request(RouteScoreRequest(route=route))
-            for route in routes
+            for route in generation.distinct_candidates
         ]
     )
 
     scored_routes = [
         ScoredRouteCandidate(**route.model_dump(), score=score)
-        for route, score in zip(routes, scores)
+        for route, score in zip(generation.distinct_candidates, scores)
     ]
+    scored_routes.sort(key=lambda route: route.score.overall_score, reverse=True)
+    scored_routes = scored_routes[: generation.diagnostics.returned_route_count]
+    logger.info(
+        "Route generate-and-score completed. requested_alternatives=%s "
+        "candidate_count_before_dedupe=%s candidate_count_after_dedupe=%s "
+        "returned_route_count=%s",
+        generation.diagnostics.requested_alternatives,
+        generation.diagnostics.raw_candidate_count,
+        generation.diagnostics.distinct_candidate_count,
+        len(scored_routes),
+    )
 
     return RouteGenerationScoredResponse(
         origin=origin,

@@ -114,6 +114,7 @@ class ScoringService:
                 pois=arcgis_result["pois"],
                 surface_summary=arcgis_result["surface_summary"],
                 rest_stops=arcgis_result["rest_stops"],
+                diagnostics=arcgis_result.get("diagnostics", {}),
             ),
             rest_stop_source_status=RestStopSourceStatus.model_validate(
                 arcgis_result["rest_stop_source_status"]

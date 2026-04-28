@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -27,6 +29,33 @@ logger = logging.getLogger(__name__)
 DEFAULT_LOCATION_RADIUS_M = 50
 DEFAULT_MINIMUM_REACHABILITY = 1
 DEFAULT_RANK_CANDIDATES = True
+MAX_INTERNAL_ROUTE_CANDIDATES = 8
+MAX_RETURNED_ROUTE_CANDIDATES = 3
+ROUTE_SIMILARITY_SAMPLE_COUNT = 12
+ROUTE_SIMILARITY_AVG_DISTANCE_M = 12.0
+ROUTE_SIMILARITY_MAX_DISTANCE_M = 35.0
+ROUTE_SIMILARITY_DISTANCE_RATIO = 0.04
+ROUTE_SIMILARITY_DURATION_RATIO = 0.08
+
+
+@dataclass(frozen=True)
+class RouteGenerationDiagnostics:
+    """Internal route generation diagnostics for logs and tests."""
+
+    requested_alternatives: int
+    internal_candidate_target: int
+    raw_candidate_count: int
+    distinct_candidate_count: int
+    returned_route_count: int
+
+
+@dataclass(frozen=True)
+class RouteGenerationResult:
+    """Generated route candidates plus internal diversity diagnostics."""
+
+    routes: list[RouteCandidate]
+    distinct_candidates: list[RouteCandidate]
+    diagnostics: RouteGenerationDiagnostics
 
 
 class ValhallaService:
@@ -45,11 +74,30 @@ class ValhallaService:
     ) -> list[RouteCandidate]:
         """Generate route candidates and normalize them around geometry output."""
 
+        result = await self.generate_route_candidates(
+            origin=origin,
+            destination=destination,
+            mode=mode,
+            alternatives=alternatives,
+        )
+        return result.routes
+
+    async def generate_route_candidates(
+        self,
+        *,
+        origin: ResolvedLocation,
+        destination: ResolvedLocation,
+        mode: str = "pedestrian",
+        alternatives: int = 1,
+    ) -> RouteGenerationResult:
+        """Generate a larger internal candidate pool and collapse near duplicates."""
+
+        internal_candidate_target = self._internal_candidate_target(alternatives)
         request_payload = self._build_route_request(
             origin,
             destination,
             mode=mode,
-            alternatives=alternatives,
+            alternatives=internal_candidate_target,
         )
         response_payload = await self._request_json_endpoint(
             self.settings.valhalla_route_url,
@@ -61,7 +109,34 @@ class ValhallaService:
         if not routes:
             raise UpstreamServiceError("Valhalla did not return any route candidates.")
 
-        return routes[: max(alternatives, 1)]
+        distinct_routes = dedupe_route_candidates(routes)
+        returned_route_count = min(
+            len(distinct_routes),
+            public_route_return_count(alternatives),
+        )
+        diagnostics = RouteGenerationDiagnostics(
+            requested_alternatives=alternatives,
+            internal_candidate_target=internal_candidate_target,
+            raw_candidate_count=len(routes),
+            distinct_candidate_count=len(distinct_routes),
+            returned_route_count=returned_route_count,
+        )
+        logger.info(
+            "Valhalla route candidates generated. requested_alternatives=%s "
+            "internal_candidate_target=%s raw_candidate_count=%s "
+            "distinct_candidate_count=%s returned_route_count=%s",
+            diagnostics.requested_alternatives,
+            diagnostics.internal_candidate_target,
+            diagnostics.raw_candidate_count,
+            diagnostics.distinct_candidate_count,
+            diagnostics.returned_route_count,
+        )
+
+        return RouteGenerationResult(
+            routes=distinct_routes[:returned_route_count],
+            distinct_candidates=distinct_routes,
+            diagnostics=diagnostics,
+        )
 
     async def locate(
         self,
@@ -98,6 +173,16 @@ class ValhallaService:
             "alternates": max(alternatives - 1, 0),
             "shape_format": "polyline6",
         }
+
+    def _internal_candidate_target(self, requested_alternatives: int) -> int:
+        """Return the Valhalla candidate count to request internally."""
+
+        configured_count = max(self.settings.valhalla_internal_candidate_count, 1)
+        requested_count = max(requested_alternatives, 1)
+        return min(
+            max(configured_count, requested_count),
+            MAX_INTERNAL_ROUTE_CANDIDATES,
+        )
 
     def _build_locate_request(
         self,
@@ -274,6 +359,135 @@ def normalize_valhalla_route_response(payload: dict[str, Any]) -> list[RouteCand
             routes.append(route)
 
     return routes
+
+
+def public_route_return_count(requested_alternatives: int) -> int:
+    """Clamp public route output to a small useful set."""
+
+    return min(max(requested_alternatives, 1), MAX_RETURNED_ROUTE_CANDIDATES)
+
+
+def dedupe_route_candidates(routes: list[RouteCandidate]) -> list[RouteCandidate]:
+    """Collapse route candidates that are effectively the same geometry."""
+
+    distinct_routes: list[RouteCandidate] = []
+    for route in routes:
+        if any(_routes_are_similar(route, kept) for kept in distinct_routes):
+            logger.info(
+                "Dropping near-duplicate Valhalla route. route_id=%s kept_count=%s",
+                route.route_id,
+                len(distinct_routes),
+            )
+            continue
+        distinct_routes.append(route)
+    return distinct_routes
+
+
+def _routes_are_similar(route_a: RouteCandidate, route_b: RouteCandidate) -> bool:
+    """Return true when two routes are too similar to keep separately."""
+
+    if route_a.encoded_polyline == route_b.encoded_polyline:
+        return True
+
+    if not route_a.decoded_shape or not route_b.decoded_shape:
+        return False
+
+    if not _relative_values_are_close(
+        route_a.distance_m,
+        route_b.distance_m,
+        ROUTE_SIMILARITY_DISTANCE_RATIO,
+    ):
+        return False
+
+    if not _relative_values_are_close(
+        route_a.duration_s,
+        route_b.duration_s,
+        ROUTE_SIMILARITY_DURATION_RATIO,
+    ):
+        return False
+
+    bbox_distance_m = _bbox_center_distance_m(route_a.decoded_shape, route_b.decoded_shape)
+    if bbox_distance_m > ROUTE_SIMILARITY_MAX_DISTANCE_M:
+        return False
+
+    sampled_a = _sample_shape(route_a.decoded_shape, ROUTE_SIMILARITY_SAMPLE_COUNT)
+    sampled_b = _sample_shape(route_b.decoded_shape, ROUTE_SIMILARITY_SAMPLE_COUNT)
+    distances = [
+        _haversine_m(point_a[1], point_a[0], point_b[1], point_b[0])
+        for point_a, point_b in zip(sampled_a, sampled_b)
+    ]
+    if not distances:
+        return False
+
+    avg_distance_m = sum(distances) / len(distances)
+    max_distance_m = max(distances)
+    return (
+        avg_distance_m <= ROUTE_SIMILARITY_AVG_DISTANCE_M
+        and max_distance_m <= ROUTE_SIMILARITY_MAX_DISTANCE_M
+    )
+
+
+def _relative_values_are_close(value_a: float, value_b: float, ratio: float) -> bool:
+    """Compare values with a relative tolerance and zero-safe fallback."""
+
+    largest = max(abs(value_a), abs(value_b), 1.0)
+    return abs(value_a - value_b) / largest <= ratio
+
+
+def _sample_shape(
+    coordinates: list[list[float]],
+    sample_count: int,
+) -> list[list[float]]:
+    """Sample route coordinates evenly by index while preserving endpoints."""
+
+    if len(coordinates) <= sample_count:
+        return [list(point) for point in coordinates]
+
+    last_index = len(coordinates) - 1
+    step = last_index / (sample_count - 1)
+    indexes = [round(index * step) for index in range(sample_count)]
+    indexes[0] = 0
+    indexes[-1] = last_index
+    return [list(coordinates[index]) for index in indexes]
+
+
+def _bbox_center_distance_m(
+    coordinates_a: list[list[float]],
+    coordinates_b: list[list[float]],
+) -> float:
+    """Return distance between route bounding-box centers."""
+
+    center_a = _bbox_center(coordinates_a)
+    center_b = _bbox_center(coordinates_b)
+    return _haversine_m(center_a[1], center_a[0], center_b[1], center_b[0])
+
+
+def _bbox_center(coordinates: list[list[float]]) -> list[float]:
+    """Return [lon, lat] center of a coordinate bounding box."""
+
+    lons = [point[0] for point in coordinates]
+    lats = [point[1] for point in coordinates]
+    return [
+        (min(lons) + max(lons)) / 2.0,
+        (min(lats) + max(lats)) / 2.0,
+    ]
+
+
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Return haversine distance in meters."""
+
+    radius_m = 6_371_000.0
+    lat1_rad = math.radians(lat1)
+    lat2_rad = math.radians(lat2)
+    delta_lat = math.radians(lat2 - lat1)
+    delta_lon = math.radians(lon2 - lon1)
+
+    a = (
+        math.sin(delta_lat / 2) ** 2
+        + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(delta_lon / 2) ** 2
+    )
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return radius_m * c
 
 
 def _extract_trip_candidates(payload: dict[str, Any]) -> list[dict[str, Any]]:

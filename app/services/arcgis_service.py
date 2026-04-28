@@ -87,14 +87,20 @@ class ArcGISService:
             "f": "json",
         }
 
-    async def query_pois(self, polyline_payload: PolylinePayload) -> list[dict[str, Any]]:
+    async def query_pois(
+        self,
+        polyline_payload: PolylinePayload,
+        *,
+        scoring_geometry: ScoringGeometry | None = None,
+    ) -> list[dict[str, Any]]:
         """Query obstacle POIs intersecting the route corridor."""
 
-        scoring_geometry = simplify_polyline_for_scoring(polyline_payload)
+        scoring_geometry = scoring_geometry or simplify_polyline_for_scoring(polyline_payload)
         return await self._query_features(
             self.settings.arcgis_poi_url,
             params=self.arcgis_intersects_params(
-                polyline_payload=scoring_geometry.polyline_payload
+                polyline_payload=scoring_geometry.polyline_payload,
+                distance_m=self.settings.arcgis_poi_corridor_distance_m,
             ),
             logical_query="POI obstacle query",
             scoring_geometry=scoring_geometry,
@@ -103,6 +109,8 @@ class ArcGISService:
     async def query_rest_stops(
         self,
         polyline_payload: PolylinePayload,
+        *,
+        scoring_geometry: ScoringGeometry | None = None,
     ) -> dict[str, Any]:
         """Query and normalize live rest-stop records near the route corridor."""
 
@@ -121,11 +129,12 @@ class ArcGISService:
 
         token_configured = bool(self.settings.arcgis_rest_stop_token)
         try:
-            scoring_geometry = simplify_polyline_for_scoring(polyline_payload)
+            scoring_geometry = scoring_geometry or simplify_polyline_for_scoring(polyline_payload)
             params = self.arcgis_intersects_params(
                 polyline_payload=scoring_geometry.polyline_payload,
                 out_fields=REST_STOP_OUT_FIELDS,
                 return_geometry=True,
+                distance_m=self.settings.arcgis_rest_stop_corridor_distance_m,
             )
             if token_configured:
                 params["token"] = self.settings.arcgis_rest_stop_token
@@ -184,16 +193,18 @@ class ArcGISService:
         *,
         layer_id: int,
         out_fields: str = "*",
+        scoring_geometry: ScoringGeometry | None = None,
     ) -> list[dict[str, Any]]:
         """Query a specific Tufts basemap layer by numeric layer id."""
 
         url = f"{self.settings.arcgis_basemap_service_url.rstrip('/')}/{layer_id}/query"
-        scoring_geometry = simplify_polyline_for_scoring(polyline_payload)
+        scoring_geometry = scoring_geometry or simplify_polyline_for_scoring(polyline_payload)
         return await self._query_features(
             url,
             params=self.arcgis_intersects_params(
                 polyline_payload=scoring_geometry.polyline_payload,
                 out_fields=out_fields,
+                distance_m=self.settings.arcgis_surface_corridor_distance_m,
             ),
             logical_query=self._basemap_layer_query_name(layer_id),
             scoring_geometry=scoring_geometry,
@@ -202,21 +213,27 @@ class ArcGISService:
     async def classify_route_surface(
         self,
         polyline_payload: PolylinePayload,
+        *,
+        scoring_geometry: ScoringGeometry | None = None,
     ) -> dict[str, Any]:
         """Approximate route surface exposure from intersecting basemap features."""
 
+        scoring_geometry = scoring_geometry or simplify_polyline_for_scoring(polyline_payload)
         gravel_features, sidewalk_features, path_features = await asyncio.gather(
             self.query_basemap_layer(
                 polyline_payload,
                 layer_id=self.settings.arcgis_gravel_layer_id,
+                scoring_geometry=scoring_geometry,
             ),
             self.query_basemap_layer(
                 polyline_payload,
                 layer_id=self.settings.arcgis_sidewalk_layer_id,
+                scoring_geometry=scoring_geometry,
             ),
             self.query_basemap_layer(
                 polyline_payload,
                 layer_id=self.settings.arcgis_path_layer_id,
+                scoring_geometry=scoring_geometry,
             ),
         )
 
@@ -257,13 +274,29 @@ class ArcGISService:
     async def query_route(self, polyline_payload: PolylinePayload) -> dict[str, Any]:
         """Query all ArcGIS inputs required by the prototype scoring service."""
 
-        pois_task = self.query_pois(polyline_payload)
-        surface_task = self.classify_route_surface(polyline_payload)
-        rest_stops_task = self.query_rest_stops(polyline_payload)
+        scoring_geometry = simplify_polyline_for_scoring(polyline_payload)
+        pois_task = self.query_pois(
+            polyline_payload,
+            scoring_geometry=scoring_geometry,
+        )
+        surface_task = self.classify_route_surface(
+            polyline_payload,
+            scoring_geometry=scoring_geometry,
+        )
+        rest_stops_task = self.query_rest_stops(
+            polyline_payload,
+            scoring_geometry=scoring_geometry,
+        )
         pois, surface_summary, rest_stop_result = await asyncio.gather(
             pois_task,
             surface_task,
             rest_stops_task,
+        )
+        diagnostics = self._build_query_diagnostics(
+            scoring_geometry=scoring_geometry,
+            poi_count=len(pois),
+            rest_stop_count=rest_stop_result["raw_feature_count"],
+            surface_counts=surface_summary["matched_feature_counts"],
         )
 
         return {
@@ -273,6 +306,7 @@ class ArcGISService:
             "rest_stop_data_available": rest_stop_result["source_status"]["available"],
             "rest_stop_source_status": rest_stop_result["source_status"],
             "rest_stop_raw_feature_count": rest_stop_result["raw_feature_count"],
+            "diagnostics": diagnostics,
         }
 
     async def _query_features(
@@ -288,16 +322,18 @@ class ArcGISService:
 
         method = "POST"
         geometry_char_length = len(params.get("geometry", ""))
+        corridor_distance = params.get("distance")
         logger.info(
             "ArcGIS request starting. logical_query=%s method=%s url=%s "
             "route_point_count=%s simplified_point_count=%s simplification_applied=%s "
-            "geometry_chars=%s",
+            "corridor_distance_m=%s geometry_chars=%s",
             logical_query,
             method,
             url,
             scoring_geometry.original_point_count,
             scoring_geometry.simplified_point_count,
             scoring_geometry.simplification_applied,
+            corridor_distance,
             geometry_char_length,
         )
 
@@ -306,11 +342,12 @@ class ArcGISService:
                 response = await client.post(url, data=params)
                 logger.info(
                     "ArcGIS response received. logical_query=%s method=%s url=%s "
-                    "status_code=%s geometry_chars=%s",
+                    "status_code=%s corridor_distance_m=%s geometry_chars=%s",
                     logical_query,
                     method,
                     url,
                     response.status_code,
+                    corridor_distance,
                     geometry_char_length,
                 )
                 response.raise_for_status()
@@ -487,7 +524,49 @@ class ArcGISService:
             )
 
         normalize = normalizer or self._normalize_feature
-        return [normalize(feature) for feature in features if isinstance(feature, dict)]
+        normalized_features = [
+            normalize(feature) for feature in features if isinstance(feature, dict)
+        ]
+        logger.info(
+            "ArcGIS query normalized. logical_query=%s method=%s url=%s "
+            "corridor_distance_m=%s raw_feature_count=%s normalized_feature_count=%s "
+            "route_point_count=%s scoring_point_count=%s",
+            logical_query,
+            method,
+            url,
+            corridor_distance,
+            len(features),
+            len(normalized_features),
+            scoring_geometry.original_point_count,
+            scoring_geometry.simplified_point_count,
+        )
+        return normalized_features
+
+    def _build_query_diagnostics(
+        self,
+        *,
+        scoring_geometry: ScoringGeometry,
+        poi_count: int,
+        rest_stop_count: int,
+        surface_counts: dict[str, int],
+    ) -> dict[str, Any]:
+        """Build compact ArcGIS scoring diagnostics for debug responses."""
+
+        return {
+            "route_point_count": scoring_geometry.original_point_count,
+            "scoring_point_count": scoring_geometry.simplified_point_count,
+            "simplification_applied": scoring_geometry.simplification_applied,
+            "corridor_distances_m": {
+                "pois": self.settings.arcgis_poi_corridor_distance_m,
+                "rest_stops": self.settings.arcgis_rest_stop_corridor_distance_m,
+                "surface": self.settings.arcgis_surface_corridor_distance_m,
+            },
+            "raw_feature_counts": {
+                "pois": poi_count,
+                "rest_stops": rest_stop_count,
+                "surface": surface_counts,
+            },
+        }
 
     def _basemap_layer_query_name(self, layer_id: int) -> str:
         """Return a stable diagnostics label for a configured basemap layer."""

@@ -52,6 +52,18 @@ class Settings(BaseSettings):
         default=10.0,
         alias="ARCGIS_CORRIDOR_DISTANCE_M",
     )
+    arcgis_poi_corridor_distance_m: float = Field(
+        default=12.0,
+        alias="ARCGIS_POI_CORRIDOR_DISTANCE_M",
+    )
+    arcgis_rest_stop_corridor_distance_m: float = Field(
+        default=18.0,
+        alias="ARCGIS_REST_STOP_CORRIDOR_DISTANCE_M",
+    )
+    arcgis_surface_corridor_distance_m: float = Field(
+        default=8.0,
+        alias="ARCGIS_SURFACE_CORRIDOR_DISTANCE_M",
+    )
     arcgis_rest_stop_url: str | None = Field(
         default=(
             "https://services3.arcgis.com/iuNbZYJOrAYBrPyC/arcgis/rest/services/"
@@ -65,6 +77,10 @@ class Settings(BaseSettings):
     )
 
     http_timeout_s: float = Field(default=15.0, alias="HTTP_TIMEOUT_S")
+    valhalla_internal_candidate_count: int = Field(
+        default=6,
+        alias="VALHALLA_INTERNAL_CANDIDATE_COUNT",
+    )
     cors_allowed_origins: str = Field(
         default=(
             "http://localhost,http://localhost:5173,http://localhost:4173,"

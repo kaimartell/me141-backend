@@ -10,7 +10,11 @@ from fastapi.testclient import TestClient
 
 from app.core.config import Settings
 from app.models.routing import ResolvedLocation
-from app.services.valhalla_service import ValhallaService
+from app.services.valhalla_service import (
+    ValhallaService,
+    dedupe_route_candidates,
+    normalize_valhalla_route_response,
+)
 from app.main import app
 
 
@@ -81,7 +85,7 @@ async def test_valhalla_route_request_uses_json_query_param_and_snapping_default
     payload = json.loads(captured["params"]["json"])  # type: ignore[index]
     assert captured["url"] == "http://localhost:8002/route"
     assert "alternatives" not in payload
-    assert payload["alternates"] == 2
+    assert payload["alternates"] == 5
     assert payload["costing"] == "pedestrian"
     assert payload["shape_format"] == "polyline6"
     assert len(payload["locations"]) == 2
@@ -92,6 +96,139 @@ async def test_valhalla_route_request_uses_json_query_param_and_snapping_default
 
     assert routes[0].decoded_shape[0][0] == pytest.approx(-71.1183248, abs=1e-6)
     assert routes[0].decoded_shape[0][1] == pytest.approx(42.40852, abs=1e-6)
+
+
+@pytest.mark.anyio
+async def test_internal_candidate_count_can_exceed_returned_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A one-route public request should still ask Valhalla for a larger pool."""
+
+    captured: dict[str, object] = {}
+    encoded_routes = [
+        _encode_polyline6(
+            [
+                [-71.1183248, 42.40852],
+                [-71.1172000, 42.40780],
+                [-71.1150000, 42.40670],
+            ]
+        ),
+        _encode_polyline6(
+            [
+                [-71.1183248, 42.40852],
+                [-71.1171950, 42.407805],
+                [-71.1150000, 42.40670],
+            ]
+        ),
+        _encode_polyline6(
+            [
+                [-71.1183248, 42.40852],
+                [-71.1172000, 42.40840],
+                [-71.1150000, 42.40670],
+            ]
+        ),
+        _encode_polyline6(
+            [
+                [-71.1183248, 42.40852],
+                [-71.1161000, 42.40720],
+                [-71.1150000, 42.40670],
+            ]
+        ),
+    ]
+    success_payload = {
+        "trip": _trip(encoded_routes[0], length=0.42, time=310),
+        "alternates": [
+            {"trip": _trip(encoded_routes[1], length=0.421, time=311)},
+            {"trip": _trip(encoded_routes[2], length=0.48, time=355)},
+            {"trip": _trip(encoded_routes[3], length=0.50, time=372)},
+        ],
+    }
+
+    class FakeAsyncClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            return None
+
+        async def __aenter__(self) -> "FakeAsyncClient":
+            return self
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        async def get(
+            self,
+            url: str,
+            *,
+            headers: dict[str, str] | None = None,
+            params: dict[str, str] | None = None,
+        ) -> httpx.Response:
+            captured["params"] = params
+            request = httpx.Request("GET", url, headers=headers, params=params)
+            return httpx.Response(200, json=success_payload, request=request)
+
+    monkeypatch.setattr("app.services.valhalla_service.httpx.AsyncClient", FakeAsyncClient)
+
+    service = ValhallaService(
+        settings=Settings(
+            VALHALLA_BASE_URL="http://localhost:8002",
+            VALHALLA_INTERNAL_CANDIDATE_COUNT=6,
+            PROTOTYPE_MODE=True,
+        )
+    )
+
+    result = await service.generate_route_candidates(
+        origin=ResolvedLocation(lat=42.40852, lon=-71.1183248, source="input_coordinates"),
+        destination=ResolvedLocation(lat=42.4067, lon=-71.1150, source="input_coordinates"),
+        mode="pedestrian",
+        alternatives=1,
+    )
+
+    payload = json.loads(captured["params"]["json"])  # type: ignore[index]
+    assert payload["alternates"] == 5
+    assert result.diagnostics.internal_candidate_target == 6
+    assert result.diagnostics.raw_candidate_count == 4
+    assert result.diagnostics.distinct_candidate_count == 3
+    assert result.diagnostics.returned_route_count == 1
+    assert len(result.routes) == 1
+    assert len(result.distinct_candidates) == 3
+
+
+def test_near_identical_routes_are_deduplicated() -> None:
+    """The lightweight similarity filter should collapse same-path alternatives."""
+
+    base = _encode_polyline6(
+        [
+            [-71.1183248, 42.40852],
+            [-71.1172000, 42.40780],
+            [-71.1150000, 42.40670],
+        ]
+    )
+    near_duplicate = _encode_polyline6(
+        [
+            [-71.1183248, 42.40852],
+            [-71.1172050, 42.407795],
+            [-71.1150000, 42.40670],
+        ]
+    )
+    distinct = _encode_polyline6(
+        [
+            [-71.1183248, 42.40852],
+            [-71.1172000, 42.40860],
+            [-71.1150000, 42.40670],
+        ]
+    )
+    routes = normalize_valhalla_route_response(
+        {
+            "trip": _trip(base, length=0.42, time=310),
+            "alternates": [
+                {"trip": _trip(near_duplicate, length=0.421, time=311)},
+                {"trip": _trip(distinct, length=0.50, time=370)},
+            ],
+        }
+    )
+
+    distinct_routes = dedupe_route_candidates(routes)
+
+    assert [route.route_id for route in distinct_routes] == ["route-1", "route-3"]
 
 
 def test_backend_maps_no_suitable_edges_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -166,6 +303,20 @@ def _encode_polyline6(coordinates: list[list[float]]) -> str:
         last_lon = current_lon
 
     return "".join(result)
+
+
+def _trip(encoded_polyline: str, *, length: float, time: float) -> dict[str, object]:
+    """Build a minimal Valhalla trip fixture."""
+
+    return {
+        "legs": [
+            {
+                "shape": encoded_polyline,
+                "summary": {"length": length, "time": time},
+            }
+        ],
+        "summary": {"length": length, "time": time},
+    }
 
 
 def _encode_value(value: int) -> str:
