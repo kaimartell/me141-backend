@@ -65,6 +65,18 @@ class Settings(BaseSettings):
     )
 
     http_timeout_s: float = Field(default=15.0, alias="HTTP_TIMEOUT_S")
+    cors_allowed_origins: str = Field(
+        default=(
+            "http://localhost,http://localhost:5173,http://localhost:4173,"
+            "http://127.0.0.1:5173,http://127.0.0.1:4173,"
+            "capacitor://localhost,ionic://localhost,https://localhost"
+        ),
+        alias="CORS_ALLOWED_ORIGINS",
+    )
+    cors_allow_origin_regex: str | None = Field(
+        default=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
+        alias="CORS_ALLOW_ORIGIN_REGEX",
+    )
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -90,6 +102,16 @@ class Settings(BaseSettings):
         """Return the Valhalla locate endpoint."""
 
         return f"{self.valhalla_base_url.rstrip('/')}/locate"
+
+    @property
+    def cors_origins(self) -> list[str]:
+        """Return configured CORS origins as a normalized list."""
+
+        return [
+            origin.strip()
+            for origin in self.cors_allowed_origins.split(",")
+            if origin.strip()
+        ]
 
 
 @lru_cache(maxsize=1)

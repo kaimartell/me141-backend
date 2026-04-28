@@ -58,3 +58,48 @@ def test_geocode_request_rejects_blank_query() -> None:
     assert response.status_code == 400
     payload = response.json()
     assert payload["error"]["type"] == "validation_error"
+
+
+def test_cors_allows_capacitor_ios_origin() -> None:
+    """Packaged iOS Capacitor WebViews should be allowed to call the API."""
+
+    response = client.options(
+        "/routes/generate-and-score",
+        headers={
+            "Origin": "capacitor://localhost",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "capacitor://localhost"
+
+
+def test_cors_allows_ionic_ios_origin() -> None:
+    """Older Ionic WebViews should also be allowed for demo installs."""
+
+    response = client.options(
+        "/routes/generate-and-score",
+        headers={
+            "Origin": "ionic://localhost",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "ionic://localhost"
+
+
+def test_cors_allows_capacitor_android_origin() -> None:
+    """Packaged Android Capacitor WebViews should be allowed to call the API."""
+
+    response = client.options(
+        "/routes/generate-and-score",
+        headers={
+            "Origin": "https://localhost",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "https://localhost"
